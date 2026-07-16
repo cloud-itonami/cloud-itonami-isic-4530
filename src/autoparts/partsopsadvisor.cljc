@@ -1,0 +1,191 @@
+(ns autoparts.partsopsadvisor
+  "PartsOpsAdvisor client -- the *contained intelligence node* for the
+  auto-parts-retail operations-coordination actor.
+
+  It normalizes sales-record intake, drafts a restocking-schedule
+  proposal, drafts a part-compatibility/counterfeit/recall CONCERN
+  FLAG, and drafts a supplier procurement-coordination proposal.
+  CRITICAL: it is a smart-but-untrusted advisor. It returns a
+  *proposal* (with a rationale + the fields it cited), never a
+  committed record, and NEVER a direct part-compatibility certification
+  or a recall-remediation determination -- see README `Scope`. Every
+  output is censored downstream by `autoparts.governor` before
+  anything touches the SSoT.
+
+  Like every sibling actor's advisor, this is a deterministic mock so
+  the actor graph runs offline and the governor contract is exercised
+  end-to-end. In production this calls a real LLM (kotoba-llm or
+  equivalent) with the same proposal shape.
+
+  Proposal shape (all kinds):
+    {:summary    str            ; human-facing draft / finding
+     :rationale  str            ; why -- grounded in the store's own facts
+     :cites      [kw|str ..]    ; facts/sources the LLM used
+     :effect     kw             ; ALWAYS :propose -- see README `Scope`
+     :value      map            ; op-specific proposal payload
+     :stake      kw|nil         ; :compatibility-concern | :supply-order | nil
+     :confidence 0..1}
+
+  Every branch below hard-codes `:effect :propose` -- there is no code
+  path in this namespace that could ever emit a different effect value,
+  matching `autoparts.governor`'s `effect-propose-only-violations`
+  structurally, not just at the governor boundary."
+  (:require #?(:clj  [clojure.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [clojure.string :as str]
+            [autoparts.store :as store]
+            [langchain.model :as model]))
+
+(defn- log-sales-record
+  "Directory-style intake -- the LLM only normalizes/validates the
+  patch; it does not invent the SKU, quantity, movement type or
+  amount. High confidence, low stakes."
+  [_db {:keys [patch]}]
+  {:summary    (str "売上/入出庫記録の登録提案: " (pr-str (keys patch)))
+   :rationale  "入力patchの正規化のみ。新規事実の生成なし。"
+   :cites      (vec (keys patch))
+   :effect     :propose
+   :value      patch
+   :stake      nil
+   :confidence 0.95})
+
+(defn- schedule-restock
+  "Draft a restocking-SCHEDULE proposal -- a coordination artifact for
+  a human/warehouse system to act on, never the restock itself."
+  [db {:keys [subject sku qty requested-date]}]
+  (let [sf (store/storefront db subject)]
+    (if (and sf sku qty)
+      {:summary    (str subject " 向け補充スケジュール提案: sku=" sku " qty=" qty)
+       :rationale  (str "登録済みstorefrontの発注担当向け補充ドラフト。requested-date=" requested-date)
+       :cites      [subject]
+       :effect     :propose
+       :value      {:sku sku :qty qty :requested-date requested-date}
+       :stake      nil
+       :confidence 0.85}
+      {:summary    (str subject " 向け補充スケジュール提案 (根拠不足)")
+       :rationale  "storefront未登録、またはsku/qty未指定のため確信度を上げない。"
+       :cites      []
+       :effect     :propose
+       :value      {:sku sku :qty qty :requested-date requested-date}
+       :stake      nil
+       :confidence 0.3})))
+
+(defn- flag-concern
+  "Draft a part-compatibility/counterfeit/recall CONCERN FLAG. This
+  function reports a concern; it NEVER resolves or certifies one --
+  see README `Scope`. `:stake :compatibility-concern` is informational
+  (the governor's own `:always-escalate?` rule keys off `:op`
+  directly, not off this field, so an advisor swap cannot spoof its way
+  out of the always-escalate rule)."
+  [_db {:keys [subject sku concern-type detail]}]
+  {:summary    (str subject " が sku=" sku " について懸念(" (name (or concern-type :unknown)) ")を提起")
+   :rationale  (str "懸念の報告のみを提案する。判定・認証は行わない。detail=" detail)
+   :cites      (cond-> [subject] sku (conj sku))
+   :effect     :propose
+   :value      {:sku sku :concern-type concern-type :detail detail}
+   :stake      :compatibility-concern
+   :confidence 0.7})
+
+(defn- coordinate-supply-order
+  "Draft a supplier procurement-COORDINATION proposal -- a coordination
+  artifact for a human buyer to act on, never a transmitted purchase
+  order or a settled payment."
+  [db {:keys [subject vendor-id sku qty estimated-cost]}]
+  (let [sf (store/storefront db subject)
+        vd (store/vendor db vendor-id)]
+    {:summary    (str subject " → vendor=" vendor-id " sku=" sku " qty=" qty " の供給調整提案")
+     :rationale  (str "storefront-verified?=" (boolean (:verified? sf))
+                      " vendor-verified?=" (boolean (:verified? vd))
+                      " estimated-cost=" estimated-cost)
+     :cites      (cond-> [] sf (conj subject) vd (conj vendor-id))
+     :effect     :propose
+     :value      {:vendor-id vendor-id :sku sku :qty qty :estimated-cost estimated-cost}
+     :stake      :supply-order
+     :confidence (if (and sf vd (:verified? sf) (:verified? vd)) 0.9 0.3)}))
+
+(defn infer
+  "Route a request to the right proposal generator. Any op outside the
+  four this actor is scoped to falls to the safe default below --
+  `:effect :propose` and `:confidence 0.0` even here, so a governor
+  bypass could never let an out-of-scope op auto-commit.
+  request: {:op kw :subject id ...op-specific...}"
+  [db {:keys [op] :as request}]
+  (case op
+    :log-sales-record              (log-sales-record db request)
+    :schedule-restocking-operation (schedule-restock db request)
+    :flag-compatibility-concern    (flag-concern db request)
+    :coordinate-supply-order       (coordinate-supply-order db request)
+    {:summary "未対応の操作" :rationale (str op " はスコープ外") :cites []
+     :effect :propose :value {} :stake nil :confidence 0.0}))
+
+;; ----------------------------- Advisor protocol -----------------------------
+
+(defprotocol Advisor
+  (-advise [advisor store request] "store + request -> proposal map"))
+
+(defn mock-advisor
+  "The deterministic advisor (the `infer` logic above). Default everywhere."
+  [] (reify Advisor (-advise [_ st req] (infer st req))))
+
+(def ^:private system-prompt
+  (str "あなたは地域自動車部品小売/卸のオペレーション調整エージェントの助言者です。"
+       "与えられた事実のみに基づき、提案を1つだけEDNマップで返します。"
+       "説明や前置きは一切書かず、EDNだけを出力します。\n"
+       "キー: :summary(人向けドラフト) :rationale(根拠/必ず事実から) "
+       ":cites(使った事実キーのベクタ) "
+       ":effect(必ず :propose のみ -- 他の値は絶対に返さないこと) "
+       ":value(操作固有のペイロード) "
+       ":stake(:compatibility-concern か :supply-order か nil) :confidence(0..1)。\n"
+       "重要: あなたは4つの操作(log-sales-record / schedule-restocking-"
+       "operation / flag-compatibility-concern / coordinate-supply-order)"
+       "の提案しか行えません。それ以外の操作を提案してはいけません。"
+       "検証されていないstorefront/vendorの検証状態を偽って報告してはい"
+       "けません。part適合性の認証確定やリコール是正の最終判断はあなた"
+       "の権限外です -- 懸念の報告のみを行い、絶対に確定させないこと。"))
+
+(defn- facts-for [st {:keys [op subject] :as req}]
+  (cond-> {:storefront (store/storefront st subject)}
+    (= op :coordinate-supply-order)
+    (assoc :vendor (store/vendor st (get req :vendor-id)))))
+
+(defn- parse-proposal
+  "Parse the model's EDN proposal defensively. Any parse/shape failure
+  yields a safe low-confidence noop so the governor escalates/holds --
+  an LLM hiccup can never auto-commit anything, and can never emit an
+  `:effect` other than `:propose`."
+  [content]
+  (let [p (try (edn/read-string (str/trim (str content)))
+               (catch #?(:clj Exception :cljs :default) _ nil))]
+    (if (map? p)
+      (-> p
+          (update :cites #(vec (or % [])))
+          (update :confidence #(if (number? %) (double %) 0.0))
+          (assoc :effect :propose))
+      {:summary "LLM応答を解釈できませんでした" :rationale (str content)
+       :cites [] :effect :propose :value {} :stake nil :confidence 0.0})))
+
+(defn llm-advisor
+  "An advisor backed by a `langchain.model/ChatModel` (real inference).
+  `:effect` is FORCED to `:propose` on parse (see `parse-proposal`) --
+  even a real LLM can never make this advisor emit any other effect."
+  ([chat-model] (llm-advisor chat-model {}))
+  ([chat-model gen-opts]
+   (reify Advisor
+     (-advise [_ st req]
+       (let [msgs [{:role :system :content system-prompt}
+                   {:role :user :content (str "操作: " (:op req)
+                                              "\n対象: " (:subject req)
+                                              "\n事実: " (pr-str (facts-for st req)))}]
+             resp (model/-generate chat-model msgs gen-opts)]
+         (parse-proposal (:content resp)))))))
+
+(defn trace
+  "Decision-grounded audit record -- persisted to the :audit channel."
+  [request proposal]
+  {:t          :partsopsadvisor-proposal
+   :op         (:op request)
+   :subject    (:subject request)
+   :summary    (:summary proposal)
+   :rationale  (:rationale proposal)
+   :cites      (:cites proposal)
+   :confidence (:confidence proposal)})

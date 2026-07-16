@@ -1,0 +1,203 @@
+(ns autoparts.governor-contract-test
+  "The governor contract as executable tests. The single invariant
+  under test:
+
+    PartsOpsAdvisor never commits a coordination proposal the
+    AutoPartsOpsGovernor would reject, `:flag-compatibility-concern`
+    NEVER auto-commits at any phase, the three other ops MAY auto-
+    commit when clean and below any applicable threshold, and every
+    decision (commit OR hold) leaves exactly one ledger fact.
+
+  Also carries the MANDATORY regression test this fleet's own
+  post-mortem requires: the default mock-advisor's own proposals for
+  its four in-scope ops must NEVER self-trip
+  `compatibility-certification-finalization-violations` -- a bug class
+  this fleet has independently hit and fixed more than once when a
+  governor's scope-exclusion term was phrased as a bare noun that then
+  matched inside the advisor's own default rationale/disclaimer text.
+  `autoparts.governor` avoids this by construction (structured-field
+  checks only, never free-text scanning) -- this test is the executable
+  proof that construction holds."
+  (:require [clojure.test :refer [deftest is testing]]
+            [langgraph.graph :as g]
+            [autoparts.governor :as governor]
+            [autoparts.operation :as op]
+            [autoparts.partsopsadvisor :as advisor]
+            [autoparts.store :as store]))
+
+(defn- fresh []
+  (let [db (store/seed-db)]
+    [db (op/build db)]))
+
+(def operator {:actor-id "op-1" :actor-role :parts-coordinator :phase 3})
+
+(defn- exec-op [actor tid request context]
+  (g/run* actor {:request request :context context} {:thread-id tid}))
+
+(defn- approve! [actor tid]
+  (g/run* actor {:approval {:status :approved :by "op-1"}} {:thread-id tid :resume? true}))
+
+;; ----------------------- happy-path auto-commit ops -----------------------
+
+(deftest clean-log-sales-record-auto-commits
+  (let [[db actor] (fresh)
+        res (exec-op actor "t1"
+                  {:op :log-sales-record :subject "store-1"
+                   :patch {:sku "sku-1" :qty -2 :type :sale :amount 4200.0}}
+                  operator)]
+    (is (= :commit (get-in res [:state :disposition])))
+    (is (= 1 (count (store/sales-log db))) "SSoT actually updated")
+    (is (= 1 (count (store/ledger db))))))
+
+(deftest clean-schedule-restock-auto-commits
+  (let [[db actor] (fresh)
+        res (exec-op actor "t2"
+                  {:op :schedule-restocking-operation :subject "store-1"
+                   :sku "sku-1" :qty 24 :requested-date "2026-07-20"}
+                  operator)]
+    (is (= :commit (get-in res [:state :disposition])))
+    (is (= 1 (count (store/restock-log db))))))
+
+(deftest clean-below-threshold-supply-order-auto-commits
+  (let [[db actor] (fresh)
+        res (exec-op actor "t3"
+                  {:op :coordinate-supply-order :subject "store-1" :vendor-id "vendor-1"
+                   :sku "sku-1" :qty 200 :estimated-cost 3200.0}
+                  operator)]
+    (is (= :commit (get-in res [:state :disposition])))
+    (is (= 1 (count (store/supply-order-log db))))))
+
+;; ----------------------- always-escalate / cost-threshold -----------------------
+
+(deftest compatibility-concern-always-escalates-then-human-decides
+  (testing "a clean, verified, high-confidence concern flag still ALWAYS interrupts for human approval"
+    (let [[db actor] (fresh)
+          r1 (exec-op actor "t4"
+                      {:op :flag-compatibility-concern :subject "store-1"
+                       :sku "sku-2" :concern-type :recall :detail "customer-reported"}
+                      operator)]
+      (is (= :interrupted (:status r1)) "pauses for human approval even when governor-clean")
+      (testing "approve -> commit, concern flag drafted"
+        (let [r2 (approve! actor "t4")]
+          (is (= :commit (get-in r2 [:state :disposition])))
+          (is (= 1 (count (store/concern-log db)))))))))
+
+(deftest above-threshold-supply-order-escalates-not-holds
+  (testing "cost above threshold escalates to a human -- it is NOT a hold"
+    (let [[db actor] (fresh)
+          r1 (exec-op actor "t5"
+                      {:op :coordinate-supply-order :subject "store-1" :vendor-id "vendor-1"
+                       :sku "sku-3" :qty 10 :estimated-cost 9000.0}
+                      operator)]
+      (is (= :interrupted (:status r1)))
+      (let [r2 (approve! actor "t5")]
+        (is (= :commit (get-in r2 [:state :disposition])))
+        (is (= 1 (count (store/supply-order-log db))))))))
+
+;; ----------------------- HARD holds -----------------------
+
+(deftest out-of-scope-op-is-held
+  (testing "an op outside the closed allowlist is rejected outright, never reaches a human"
+    (let [[db actor] (fresh)
+          res (exec-op actor "t6"
+                      {:op :finalize-compatibility-certification :subject "store-1"}
+                      operator)]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:closed-op-allowlist} (-> (store/ledger db) first :basis))))))
+
+(deftest unverified-storefront-is-held
+  (testing "an unregistered/unverified storefront can never have a proposal committed on its behalf"
+    (let [[db actor] (fresh)
+          res (exec-op actor "t7"
+                      {:op :log-sales-record :subject "store-2"
+                       :patch {:sku "sku-1" :qty -1 :type :sale :amount 2100.0}}
+                      operator)]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:storefront-not-verified} (-> (store/ledger db) first :basis)))
+      (is (empty? (store/sales-log db))))))
+
+(deftest unverified-vendor-is-held
+  (testing "an unverified target vendor blocks a supply-order coordination, even from a verified storefront"
+    (let [[db actor] (fresh)
+          res (exec-op actor "t8"
+                      {:op :coordinate-supply-order :subject "store-1" :vendor-id "vendor-2"
+                       :sku "sku-1" :qty 50 :estimated-cost 900.0}
+                      operator)]
+      (is (= :hold (get-in res [:state :disposition])))
+      (is (some #{:vendor-not-verified} (-> (store/ledger db) first :basis)))
+      (is (empty? (store/supply-order-log db))))))
+
+(deftest every-decision-leaves-one-ledger-fact
+  (testing "write-only-through-ledger: N operations -> N ledger facts"
+    (let [[db actor] (fresh)]
+      (exec-op actor "a" {:op :log-sales-record :subject "store-1"
+                          :patch {:sku "sku-1" :qty -1 :type :sale :amount 2100.0}} operator)
+      (exec-op actor "b" {:op :log-sales-record :subject "store-2"
+                          :patch {:sku "sku-1" :qty -1 :type :sale :amount 2100.0}} operator)
+      (is (= 2 (count (store/ledger db)))
+          "one commit + one hold, both recorded"))))
+
+;; ----------------------- governor unit tests: synthetic adversarial proposals -----------------------
+;;
+;; The real PartsOpsAdvisor NEVER emits a non-:propose effect or a
+;; compatibility-certification-finalization flag (see
+;; `autoparts.partsopsadvisor`'s hard-coded `:effect :propose` on every
+;; branch). These two HARD checks exist as defense-in-depth against a
+;; SWAPPED advisor (e.g. a real LLM, or a future bug) -- so they are
+;; exercised here directly against `governor/check` with a hand-built
+;; synthetic proposal, the only way to reach them at all.
+
+(deftest spoofed-non-propose-effect-is-a-hard-violation
+  (let [db (store/seed-db)
+        request {:op :log-sales-record :subject "store-1"}
+        proposal {:effect :execute :value {:sku "sku-1"} :confidence 0.99}
+        verdict (governor/check request proposal db)]
+    (is (:hard? verdict))
+    (is (some #{:effect-not-propose} (map :rule (:violations verdict))))))
+
+(deftest direct-certification-finalization-flag-is-a-hard-permanent-violation
+  (let [db (store/seed-db)
+        request {:op :flag-compatibility-concern :subject "store-1"}
+        proposal {:effect :propose
+                  :value {:sku "sku-1" :compatibility-certification-finalized? true}
+                  :confidence 0.99}
+        verdict (governor/check request proposal db)]
+    (is (:hard? verdict))
+    (is (some #{:compatibility-certification-finalization-blocked} (map :rule (:violations verdict))))))
+
+(deftest banned-finalization-op-is-caught-by-two-independent-rules
+  (testing "defense-in-depth: the banned op fails BOTH the allowlist gate AND the dedicated finalization-block gate"
+    (let [db (store/seed-db)
+          request {:op :finalize-compatibility-certification :subject "store-1"}
+          proposal {:effect :propose :value {} :confidence 0.99}
+          verdict (governor/check request proposal db)
+          rules (set (map :rule (:violations verdict)))]
+      (is (:hard? verdict))
+      (is (contains? rules :closed-op-allowlist))
+      (is (contains? rules :compatibility-certification-finalization-blocked)))))
+
+;; ----------------------- MANDATORY: no self-trip on the advisor's own happy path -----------------------
+
+(deftest default-mock-advisor-proposals-never-self-trip-scope-exclusion
+  (testing "the mock advisor's own DEFAULT proposal for every in-scope op, against clean verified
+           demo data, must NEVER trip compatibility-certification-finalization-violations --
+           the exact bug class this fleet has independently hit and fixed more than once when a
+           scope-exclusion term was phrased as a bare noun matching the advisor's own rationale text"
+    (let [db (store/seed-db)
+          requests [{:op :log-sales-record :subject "store-1"
+                     :patch {:sku "sku-1" :qty -2 :type :sale :amount 4200.0}}
+                    {:op :schedule-restocking-operation :subject "store-1"
+                     :sku "sku-1" :qty 24 :requested-date "2026-07-20"}
+                    {:op :flag-compatibility-concern :subject "store-1"
+                     :sku "sku-2" :concern-type :recall :detail "customer-reported"}
+                    {:op :coordinate-supply-order :subject "store-1" :vendor-id "vendor-1"
+                     :sku "sku-1" :qty 200 :estimated-cost 3200.0}]]
+      (doseq [request requests]
+        (let [proposal (advisor/infer db request)
+              verdict (governor/check request proposal db)
+              rules (set (map :rule (:violations verdict)))]
+          (is (not (contains? rules :compatibility-certification-finalization-blocked))
+              (str (:op request) ": mock advisor's own default proposal must never self-trip "
+                   "the compatibility-certification-finalization-block, rationale=" (pr-str (:rationale proposal))))
+          (is (not (contains? rules :effect-not-propose))
+              (str (:op request) ": mock advisor must always emit :effect :propose")))))))

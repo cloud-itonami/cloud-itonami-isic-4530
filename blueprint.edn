@@ -1,0 +1,11 @@
+{:itonami.blueprint/id "cloud-itonami-isic-4530"
+ :itonami.blueprint/name "Sale of motor vehicle parts and accessories"
+ :itonami.blueprint/isic-rev5 "4530"
+ :itonami.blueprint/domain :downstream/auto-parts-retail
+ :itonami.blueprint/license "AGPL-3.0-or-later"
+ :itonami.blueprint/social-impact [:safety :consumer-protection :transparency]
+ :itonami.blueprint/governor :auto-parts-ops-governor
+ :itonami.blueprint/required-technologies [:robotics :identity :forms :dmn :bpmn :audit-ledger :retail]
+ :itonami.blueprint/status :public-oss
+ :itonami.blueprint/robotics true
+ :itonami.blueprint/maturity :implemented}
