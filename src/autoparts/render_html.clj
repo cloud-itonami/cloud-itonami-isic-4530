@@ -1,223 +1,177 @@
 (ns autoparts.render-html
   "Build-time HTML renderer for `docs/samples/operator-console.html`.
 
-  Closes flagship checklist item 2 (com-junkawasaki/root ADR-2607189300):
-  this repo previously had NO demo page and no generator at all. This
-  namespace drives the REAL actor stack --
-  `autoparts.partsopsadvisor` -> `autoparts.governor` ->
-  `autoparts.phase` -> `autoparts.store`, wired by
-  `autoparts.operation`'s langgraph-clj StateGraph and executed through
-  `langgraph.graph/run*` -- and renders the resulting store, audit
-  ledger, coordination logs and per-run audit trails.
+  Drives the REAL actor stack of THIS repo and renders whatever it
+  produced. Nothing on the page is mock or hand-typed:
 
-  NOTHING on the page is hand-typed telemetry. Every op, subject,
-  confidence, disposition, hold rule, hold detail, coordination-id and
-  log row below is read back out of the real run. The policy tables are
-  read out of the real `autoparts.governor` / `autoparts.phase` vars
-  (`allowed-ops`, `confidence-floor`, `supply-order-cost-threshold`,
-  `banned-finalization-ops`, `phases`), not restated in prose -- so a
-  policy change moves the page without anyone editing this file.
+    - the graph is the real compiled `autoparts.operation/build`
+      StateGraph, driven with `langgraph.graph/run*` exactly the way
+      `autoparts.sim` (`clojure -M:dev:run`) drives it,
+    - the SSoT is a fresh `autoparts.store/seed-db` MemStore, and every
+      storefront / vendor / coordination-log row below is read BACK out
+      of that store through the `Store` protocol after the run,
+    - every HARD-hold rule name and every violation detail string is the
+      `autoparts.governor`'s own `:violations` entry, off the ledger
+      fact -- this namespace contains no rule text of its own,
+    - the rollout-phase table is derived from `autoparts.phase/phases`,
+      the governor-configuration table from `autoparts.governor` public
+      vars, and the concern-source table from `autoparts.facts`.
 
-  DETERMINISM: no timestamp, no random id, no wall clock anywhere in
-  the page. Coordination ids come from `autoparts.registry`'s
-  per-storefront-per-kind sequence counter, which starts at 0 in a
-  freshly seeded `store/seed-db`. Two consecutive runs are
-  byte-identical (verified by `cmp`).
+  Subject provenance (the demo may not invent subjects): every subject
+  driven below is one of the four ids `autoparts.store/demo-data`
+  actually seeds -- storefronts `store-1` (independently verified) and
+  `store-2` (unverified), vendors `vendor-1` (verified) and `vendor-2`
+  (unverified). Verified against the seed before this file was written;
+  `clojure -M:dev:run` was run first and its ledger inspected.
 
-  Usage: `clojure -M:dev:render-html [out-file]`
-  (default `docs/samples/operator-console.html`)."
+  Deterministic: no clock, no randomness, no network, no timestamp in
+  the page content. Re-running writes a byte-identical file.
+
+  Run: `clojure -M:dev:render-html [out-file]`
+  (default out-file `docs/samples/operator-console.html`)."
   (:require [jp-go-dds.skin]
-            [clojure.java.io :as io]
             [clojure.string :as str]
-            [autoparts.store :as store]
-            [autoparts.operation :as op]
+            [langgraph.graph :as g]
+            [autoparts.facts :as facts]
             [autoparts.governor :as governor]
+            [autoparts.operation :as op]
             [autoparts.partsopsadvisor :as advisor]
             [autoparts.phase :as phase]
-            [autoparts.facts :as facts]
-            [langgraph.graph :as g]))
+            [autoparts.store :as store]))
 
-;; ───────────────────────── scenario drivers ─────────────────────────
+;; ----------------------------- the run -----------------------------
 
-(def ^:private phase-3-operator
-  {:actor-id "op-1" :actor-role :parts-coordinator :phase 3})
+(def ^:private coordinator
+  "The same operator context `autoparts.sim` uses."
+  {:actor-id "op-1" :actor-role :parts-coordinator :phase phase/default-phase})
 
-(def ^:private phase-1-operator
-  {:actor-id "op-1" :actor-role :parts-coordinator :phase 1})
+(def ^:private phase-1-coordinator
+  "The SAME actor, run by an operator whose deployment is still at
+  rollout phase 1 (`assisted-logging`). Used to show that the phase gate
+  is a second, independent layer on top of the governor."
+  (assoc coordinator :phase 1))
 
-(defn- tampered-advisor
-  "A DELIBERATELY compromised advisor used to exercise the two governor
-  HARD checks that the honest `mock-advisor` can never trip on its own
-  (`effect-propose-only` and the structured half of
-  `compatibility-certification-finalization-block`).
-
-  It runs this repo's OWN real `autoparts.partsopsadvisor/infer` and
-  then applies `f` to the resulting proposal -- i.e. it models an
-  advisor swap / prompt-injected LLM, which is exactly the threat the
-  AutoPartsOpsGovernor exists to be independent of. The governor is
-  untouched; only the untrusted node is."
-  [f]
-  (reify advisor/Advisor
-    (-advise [_ st req] (f (advisor/infer st req)))))
-
-(defn- run-op!
-  "Executes ONE real operation on `actor` and records the real run.
-  `approve` is `:approved`, `:rejected`, or nil (never expected to
-  pause). If the graph did not actually pause at `:request-approval`,
-  no approval is sent -- the page then honestly shows an auto-commit."
-  [runs actor tid label request ctx & [approve]]
-  (let [r1 (g/run* actor {:request request :context ctx} {:thread-id tid})
-        r2 (when (and approve (= :interrupted (:status r1)))
-             (g/run* actor {:approval {:status approve :by (:actor-id ctx)}}
-                     {:thread-id tid :resume? true}))
-        final (or r2 r1)]
-    (swap! runs conj {:tid     tid
-                      :label   label
-                      :request request
-                      :phase   (:phase ctx)
-                      :audit   (get-in final [:state :audit])
-                      :verdict (get-in final [:state :verdict])
-                      :status  (:status final)})
-    final))
-
-(defn run-demo!
-  "Runs a fresh seeded store through a scenario that reaches EVERY
-  disposition this actor can produce, so the console shows both sides
-  of the gate:
-
-  auto-commit (phase 3, governor-clean, high confidence)
-    01 :log-sales-record                 store-1
-    02 :schedule-restocking-operation    store-1
-    03 :coordinate-supply-order          store-1 -> vendor-1, below the
-                                         cost threshold
-
-  escalate -> human approves -> commit
-    04 :flag-compatibility-concern       ALWAYS escalates at any phase,
-                                         any confidence (two independent
-                                         layers agree: the governor's
-                                         `:always-escalate?` and the
-                                         permanent absence of this op
-                                         from every phase's `:auto` set)
-    05 :coordinate-supply-order          above `supply-order-cost-threshold`
-    06 :schedule-restocking-operation    sku/qty missing -> the advisor
-                                         itself drops to 0.3, under the
-                                         confidence floor
-    09 :log-sales-record at PHASE 1      writable but not auto-eligible
-                                         -> `:phase-approval`
-
-  escalate -> human REJECTS -> hold
-    07 :flag-compatibility-concern       the approver declines
-
-  HARD hold -- never reaches a human, cannot be overridden
-    08 :coordinate-supply-order at PHASE 1  `:phase-disabled` (not yet
-                                            writable in this phase)
-    10 :finalize-compatibility-certification  `:closed-op-allowlist` +
-                                            `:compatibility-certification-
-                                            finalization-blocked`
-    11 :log-sales-record store-2         `:storefront-not-verified`
-    12 :coordinate-supply-order vendor-2 `:vendor-not-verified`
-    13 tampered advisor spoofs `:effect :execute`  `:effect-not-propose`
-    14 tampered advisor sets `:compatibility-certification-finalized? true`
-                                         inside `:value` ->
-                                         `:compatibility-certification-
-                                         finalization-blocked`
-
-  Scenario 04 doubles as the standing regression for this fleet's
-  documented self-trip bug class: the honest advisor's DEFAULT concern
-  rationale contains the bare noun 認証 (certification), and it still
-  commits -- because the governor checks STRUCTURED fields only, never
-  free-text prose.
-
-  Returns {:db store :runs [..]} -- both real."
+(defn- drifted-advisor
+  "A deliberately DRIFTED advisor: same proposal shape, but it claims an
+  `:effect` other than `:propose`. The shipped
+  `autoparts.partsopsadvisor` structurally cannot emit this (every
+  branch hard-codes `:propose`), so the only honest way to exercise the
+  governor's `effect-propose-only` rule end-to-end is to swap the
+  injected advisor -- which is exactly the seam
+  `autoparts.operation/build` exposes for a real-LLM swap. The proposal
+  still travels the whole graph; the governor rejects it."
   []
-  (let [db     (store/seed-db)
-        actor  (op/build db)
-        spoof-effect (op/build db {:advisor (tampered-advisor
-                                             #(assoc % :effect :execute))})
-        spoof-cert   (op/build db {:advisor (tampered-advisor
-                                             #(assoc-in % [:value :compatibility-certification-finalized?] true))})
-        runs   (atom [])]
+  (reify advisor/Advisor
+    (-advise [_ st req]
+      (assoc (advisor/infer st req) :effect :direct-write))))
 
-    ;; ---- clean, auto-committing paths (phase 3) ----
-    (run-op! runs actor "t01" "売上/入出庫記録の登録 (clean)"
-             {:op :log-sales-record :subject "store-1"
-              :patch {:sku "sku-brake-pad-001" :qty -2 :type :sale :amount 4200.0}}
-             phase-3-operator)
+(def ^:private scenarios
+  "One entry = one coordination request driven through the real actor.
+  `:approval`, when present, is the human decision handed back to the
+  graph while it is paused at `:request-approval`
+  (`interrupt-before #{:request-approval}`). `:exercises` documents what
+  the scenario is FOR; every other column on the timeline table is read
+  off what the graph actually did."
+  [{:tid "t01"
+    :exercises "Sales-record intake against the independently verified storefront. Governor-clean, high confidence, and :log-sales-record is in phase 3's :auto set -> auto-commit with no human in the loop."
+    :request {:op :log-sales-record :subject "store-1"
+              :patch {:sku "sku-brake-pad-001" :qty -2 :type :sale :amount 4200.0}}}
 
-    (run-op! runs actor "t02" "補充スケジュール調整 (clean)"
-             {:op :schedule-restocking-operation :subject "store-1"
-              :sku "sku-brake-pad-001" :qty 24 :requested-date "2026-07-20"}
-             phase-3-operator)
+   {:tid "t02"
+    :exercises "Restocking-schedule draft for the same verified storefront. Also auto-eligible at phase 3 -> auto-commit. Drafts the record a warehouse system would act on; restocks nothing itself."
+    :request {:op :schedule-restocking-operation :subject "store-1"
+              :sku "sku-brake-pad-001" :qty 24 :requested-date "2026-07-20"}}
 
-    (run-op! runs actor "t03" "供給調整 (しきい値未満 -> 自動確定)"
-             {:op :coordinate-supply-order :subject "store-1" :vendor-id "vendor-1"
-              :sku "sku-brake-pad-001" :qty 200 :estimated-cost 3200.0}
-             phase-3-operator)
+   {:tid "t03"
+    :exercises "Supply-order coordination to the verified vendor, below the governor's cost threshold -> auto-commit. Transmits no purchase order."
+    :request {:op :coordinate-supply-order :subject "store-1" :vendor-id "vendor-1"
+              :sku "sku-brake-pad-001" :qty 200 :estimated-cost 3200.0}}
 
-    ;; ---- escalate -> approved ----
-    (run-op! runs actor "t04" "適合性懸念のフラグ (常にエスカレーション)"
-             {:op :flag-compatibility-concern :subject "store-1"
+   {:tid "t04"
+    :exercises "A part-compatibility / recall CONCERN. ALWAYS escalates at any confidence and any phase -- two independent layers (governor :always-escalate? and phase, which never lists this op as auto-eligible) agree. The human approves the FLAG, not a certification."
+    :request {:op :flag-compatibility-concern :subject "store-1"
               :sku "sku-oil-filter-099" :concern-type :recall
               :detail "NHTSA recall campaign match reported by a customer"}
-             phase-3-operator :approved)
+    :approval {:status :approved :by "op-1"}}
 
-    (run-op! runs actor "t05" "供給調整 (しきい値超過 -> 承認要求)"
-             {:op :coordinate-supply-order :subject "store-1" :vendor-id "vendor-1"
+   {:tid "t05"
+    :exercises "Supply-order coordination ABOVE the governor's cost threshold. Governor otherwise clean and confidence high, but cost alone escalates it; the human buyer approves."
+    :request {:op :coordinate-supply-order :subject "store-1" :vendor-id "vendor-1"
               :sku "sku-alternator-014" :qty 10 :estimated-cost 9000.0}
-             phase-3-operator :approved)
+    :approval {:status :approved :by "op-1"}}
 
-    (run-op! runs actor "t06" "補充スケジュール調整 (根拠不足 -> 確信度フロア割れ)"
-             {:op :schedule-restocking-operation :subject "store-1"
-              :requested-date "2026-07-28"}
-             phase-3-operator :approved)
+   {:tid "t06"
+    :exercises "The same high-cost supply order, VETOED by the human buyer. Distinct from a HARD hold: the governor found nothing wrong, a person declined. Lands on the ledger as :approval-rejected."
+    :request {:op :coordinate-supply-order :subject "store-1" :vendor-id "vendor-1"
+              :sku "sku-alternator-014" :qty 40 :estimated-cost 36000.0}
+    :approval {:status :rejected :by "op-1"}}
 
-    ;; ---- escalate -> rejected ----
-    (run-op! runs actor "t07" "適合性懸念のフラグ (承認者が却下)"
-             {:op :flag-compatibility-concern :subject "store-1"
-              :sku "sku-spark-plug-042" :concern-type :counterfeit
-              :detail "Packaging hologram mismatch reported by the counter staff"}
-             phase-3-operator :rejected)
+   {:tid "t07"
+    :exercises "An op outside the closed allowlist that also names the banned finalization action. BOTH HARD rules fire; a human is never offered the decision, and the approval below is never reached."
+    :request {:op :finalize-compatibility-certification :subject "store-1"}
+    :approval {:status :approved :by "op-1"}}
 
-    ;; ---- phase gate (phase 1 operator) ----
-    (run-op! runs actor "t08" "供給調整をフェーズ1で実行 (未解禁 -> HARD hold)"
-             {:op :coordinate-supply-order :subject "store-1" :vendor-id "vendor-1"
-              :sku "sku-brake-pad-001" :qty 12 :estimated-cost 800.0}
-             phase-1-operator :approved)
+   {:tid "t08"
+    :exercises "Sales-record intake initiated by the seeded UNVERIFIED pop-up storefront. HARD hold -- no proposal is ever committed on behalf of a party nobody independently verified."
+    :request {:op :log-sales-record :subject "store-2"
+              :patch {:sku "sku-brake-pad-001" :qty -1 :type :sale :amount 2100.0}}}
 
-    (run-op! runs actor "t09" "売上記録をフェーズ1で実行 (解禁済/自動不可 -> 承認要求)"
-             {:op :log-sales-record :subject "store-1"
-              :patch {:sku "sku-wiper-blade-311" :qty -1 :type :sale :amount 1800.0}}
-             phase-1-operator :approved)
+   {:tid "t09"
+    :exercises "Supply-order coordination from the VERIFIED storefront to the seeded UNVERIFIED grey-market vendor. The initiating party is fine; the counterparty is not. HARD hold."
+    :request {:op :coordinate-supply-order :subject "store-1" :vendor-id "vendor-2"
+              :sku "sku-brake-pad-001" :qty 50 :estimated-cost 900.0}}
 
-    ;; ---- HARD holds: governor violations ----
-    (run-op! runs actor "t10" "適合性認証の確定を試行 (スコープ外の操作)"
-             {:op :finalize-compatibility-certification :subject "store-1"}
-             phase-3-operator :approved)
+   {:tid "t10"
+    :exercises "An IN-SCOPE op (:log-sales-record, verified storefront, high confidence) carrying a structured flag that would finalize a part-compatibility certification. Caught on the :value flag alone -- never by scanning prose. HARD hold, permanently un-overridable."
+    :request {:op :log-sales-record :subject "store-1"
+              :patch {:sku "sku-oil-filter-099" :qty -1 :type :sale :amount 3300.0
+                      :compatibility-certification-finalized? true}}
+    :approval {:status :approved :by "op-1"}}
 
-    (run-op! runs actor "t11" "未検証storefrontからの売上記録"
-             {:op :log-sales-record :subject "store-2"
-              :patch {:sku "sku-brake-pad-001" :qty -1 :type :sale :amount 2100.0}}
-             phase-3-operator :approved)
+   {:tid "t11"
+    :exercises "A DRIFTED advisor whose proposal claims :effect :direct-write instead of :propose. Everything else about the request is clean. HARD hold -- this actor commits proposals and nothing else."
+    :advisor :drifted
+    :request {:op :schedule-restocking-operation :subject "store-1"
+              :sku "sku-wiper-blade-220" :qty 12 :requested-date "2026-07-28"}}
 
-    (run-op! runs actor "t12" "未検証vendorへの供給調整"
-             {:op :coordinate-supply-order :subject "store-1" :vendor-id "vendor-2"
-              :sku "sku-brake-pad-001" :qty 50 :estimated-cost 900.0}
-             phase-3-operator :approved)
+   {:tid "t12"
+    :exercises "The SAME clean, governor-approved supply order as t03, run by an operator still at rollout phase 1 (assisted-logging). The governor cleared it; the phase gate holds it anyway (:phase-disabled). Second independent layer."
+    :context :phase-1
+    :request {:op :coordinate-supply-order :subject "store-1" :vendor-id "vendor-1"
+              :sku "sku-brake-pad-001" :qty 200 :estimated-cost 3200.0}}])
 
-    (run-op! runs spoof-effect "t13" "改竄アドバイザ: :effect を :execute に詐称"
-             {:op :log-sales-record :subject "store-1"
-              :patch {:sku "sku-timing-belt-208" :qty -1 :type :sale :amount 7600.0}}
-             phase-3-operator :approved)
+(defn- drive!
+  "Runs one scenario through the real compiled graph and returns the
+  scenario enriched with what the graph actually did."
+  [actors {:keys [tid request approval advisor context] :as scenario}]
+  (let [actor (get actors (or advisor :shipped))
+        ctx   (if (= :phase-1 context) phase-1-coordinator coordinator)
+        r1      (g/run* actor {:request request :context ctx} {:thread-id tid})
+        paused? (= :interrupted (:status r1))
+        r2      (when (and approval paused?)
+                  (g/run* actor {:approval approval} {:thread-id tid :resume? true}))
+        final   (:state (or r2 r1))
+        audit   (:audit final [])]
+    (assoc scenario
+           :phase       (:phase ctx)
+           :verdict     (:verdict final)
+           :paused?     paused?
+           :escalation  (first (filter #(= :approval-requested (:t %)) audit))
+           :hold-fact   (first (filter #(= :governor-hold (:t %)) audit))
+           :human       (when r2 (:status approval))
+           :disposition (:disposition final))))
 
-    (run-op! runs spoof-cert "t14" "改竄アドバイザ: :value に認証確定フラグを注入"
-             {:op :flag-compatibility-concern :subject "store-1"
-              :sku "sku-oil-filter-099" :concern-type :compatibility
-              :detail "Advisor attempts to close the question itself"}
-             phase-3-operator :approved)
+(defn run-demo!
+  "Seeds a fresh MemStore, builds the real actor twice over the SAME
+  store -- once with the shipped `mock-advisor`, once with the drifted
+  advisor above -- and drives every scenario. Returns {:db .. :runs ..}."
+  []
+  (let [db     (store/seed-db)
+        actors {:shipped (op/build db)
+                :drifted (op/build db {:advisor (drifted-advisor)})}]
+    {:db db :runs (mapv #(drive! actors %) scenarios)}))
 
-    {:db db :runs @runs}))
-
-;; ───────────────────────── rendering helpers ─────────────────────────
+;; ----------------------------- html helpers -----------------------------
 
 (defn- esc [v]
   (-> (str v)
@@ -226,321 +180,389 @@
       (str/replace ">" "&gt;")
       (str/replace "\"" "&quot;")))
 
-(defn- lbl
-  "keyword -> its name, anything else -> its printed form. Used for the
-  heterogeneous `:basis`/`:cites` vectors (this actor cites both
-  keywords like `:sku` and ids like \"store-1\")."
-  [x]
-  (cond (nil? x) "" (keyword? x) (name x) :else (str x)))
+(defn- fmt
+  "Render a stored value, or an em dash when the domain model carries no
+  value for that field on that record."
+  [v]
+  (if (nil? v) "—" (esc v)))
 
-(defn- join-lbl [xs] (str/join ", " (map lbl xs)))
+(defn- code [v] (str "<code>" (esc v) "</code>"))
 
-(defn- fact-of [audit t] (first (filter #(= t (:t %)) audit)))
+(defn- flag [v]
+  (if (true? v)
+    "<span class=\"ok\">true</span>"
+    (str "<span class=\"critical\">" (if (nil? v) "—" (esc v)) "</span>")))
 
-(defn- run-outcome
-  "Classify ONE real run from its real audit trail. Returns
-  {:kind kw :cell html :reason str}."
-  [{:keys [audit]}]
-  (let [committed (fact-of audit :committed)
-        granted   (fact-of audit :approval-granted)
-        requested (fact-of audit :approval-requested)
-        rejected  (fact-of audit :approval-rejected)
-        hold      (fact-of audit :governor-hold)]
-    (cond
-      (and committed granted)
-      {:kind :approved
-       :cell "<span class=\"ok\">承認のうえ確定</span>"
-       :reason (str "承認要求理由: " (lbl (:reason requested))
-                    " · 承認者: " (lbl (:by granted)))}
+(defn- codes
+  "Render a SEQUENCE of keywords in the order the code produced it --
+  `:basis` order is the governor's own evaluation order."
+  [coll]
+  (if (seq coll) (str/join " " (map code coll)) "—"))
 
-      committed
-      {:kind :auto
-       :cell "<span class=\"ok\">自動確定</span>"
-       :reason "ガバナ違反なし・確信度フロア以上・フェーズ3で自動確定可"}
+(defn- kw-codes
+  "Render a SET of keywords. Sorted -- a set has no order, and an
+  unsorted render would make the output non-deterministic."
+  [coll]
+  (str/join " " (map code (sort-by str coll))))
 
-      rejected
-      {:kind :rejected
-       :cell "<span class=\"warn\">承認者が却下</span>"
-       :reason (str "承認要求理由: " (lbl (:reason requested))
-                    " · 却下根拠: " (join-lbl (:basis rejected)))}
+(defn- tr [& cells] (str "<tr>" (apply str (map #(str "<td>" % "</td>") cells)) "</tr>"))
 
-      hold
-      {:kind :hold
-       :cell (if (seq (:basis hold))
-               "<span class=\"critical\">HARD hold · ガバナ違反 · 人間に到達しない</span>"
-               "<span class=\"critical\">HARD hold · フェーズゲート · 人間に到達しない</span>")
-       :reason (let [rules (:basis hold)
-                     pr    (:phase-reason hold)]
-                 (str/join " · " (remove str/blank?
-                                         [(when (seq rules) (join-lbl rules))
-                                          (when pr (str "phase-gate: " (lbl pr)
-                                                        " (phase " (:phase hold) ")"))])))}
+(defn- table [headers rows]
+  (str "<table><thead><tr>"
+       (apply str (map #(str "<th>" (esc %) "</th>") headers))
+       "</tr></thead><tbody>\n"
+       (str/join "\n" rows)
+       "\n</tbody></table>"))
 
-      :else
-      {:kind :other :cell "<span class=\"muted\">進行中</span>" :reason ""})))
+(defn- card [title note body]
+  (str "<section class=\"card\"><h2>" (esc title) "</h2>"
+       (when note (str "<p class=\"muted\">" note "</p>"))
+       body "</section>"))
 
-;; ───────────────────────── sections ─────────────────────────
+;; ----------------------------- sections -----------------------------
 
-(defn- party-rows [db]
-  (let [sf (->> (:storefronts (store/demo-data)) keys sort
-                (map #(vector "storefront" (store/storefront db %))))
-        vd (->> (:vendors (store/demo-data)) keys sort
-                (map #(vector "vendor" (store/vendor db %))))]
-    (str/join "\n"
-      (for [[kind {:keys [id name verified?]}] (concat sf vd)]
-        (format "        <tr><td>%s</td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
-                (esc kind) (esc id) (esc name)
-                (if verified?
-                  "<span class=\"ok\">独立検証済み</span>"
-                  "<span class=\"critical\">未検証 — 提案は commit されない</span>"))))))
+(defn- ledger-of [db] (vec (store/ledger db)))
 
-(defn- run-rows [runs]
-  (str/join "\n"
-    (for [{:keys [tid label request phase verdict] :as r} runs
-          :let [{:keys [cell reason]} (run-outcome r)]]
-      (format "        <tr><td><code>%s</code></td><td>%s</td><td><code>%s</code></td><td><code>%s</code></td><td class=\"num\">%s</td><td class=\"num\">%s</td><td>%s</td><td>%s</td></tr>"
-              (esc tid) (esc label)
-              (esc (lbl (:op request))) (esc (:subject request))
-              (esc phase)
-              (esc (:confidence verdict))
-              cell (esc reason)))))
+(defn- holds
+  "Every `:governor-hold` fact on the append-only ledger."
+  [db]
+  (filterv #(= :governor-hold (:t %)) (ledger-of db)))
 
-(defn- ledger-rows [ledger]
-  (str/join "\n"
-    (for [{:keys [t op subject disposition basis phase-reason confidence] :as f} ledger]
-      (format "        <tr><td>%s</td><td><code>%s</code></td><td><code>%s</code></td><td>%s</td><td>%s</td><td class=\"num\">%s</td><td>%s</td></tr>"
-              (esc (lbl t)) (esc (lbl op)) (esc subject) (esc (lbl disposition))
-              (esc (str/join " · " (remove str/blank?
-                                           [(join-lbl basis)
-                                            (when phase-reason (str "phase-gate: " (lbl phase-reason)))])))
-              (esc confidence)
-              (esc (str/join " / " (map :detail (:violations f))))))))
+(defn- rule-holds
+  "The subset of holds carrying at least one governor rule violation --
+  i.e. a HARD compliance hold, as opposed to a rollout-phase hold."
+  [db]
+  (filterv #(seq (:violations %)) (holds db)))
 
-(defn- coordination-rows [rows]
-  (if (seq rows)
-    (str/join "\n"
-      (for [{:keys [coordination-id storefront-id] :as row} rows]
-        (format "        <tr><td><code>%s</code></td><td><code>%s</code></td><td>%s</td></tr>"
-                (esc coordination-id) (esc storefront-id)
-                (esc (pr-str (dissoc row :coordination-id :storefront-id))))))
-    "        <tr><td colspan=\"3\" class=\"muted\">この実行では 0 件</td></tr>"))
+(defn- summary-section [db runs]
+  (let [led (ledger-of db)
+        n   (fn [t] (count (filter #(= t (:t %)) led)))]
+    (card "Run summary"
+          (str "Every number below is a count over this actor's own append-only ledger after "
+               "driving " (count runs) " requests through " (code "autoparts.operation/build")
+               ". No usage, revenue or performance metric is claimed anywhere on this page.")
+          (table ["Measure" "Count"]
+                 [(tr "requests driven" (esc (count runs)))
+                  (tr "ledger facts" (esc (count led)))
+                  (tr (str "commits " (code ":committed")) (esc (n :committed)))
+                  (tr (str "governor / phase holds " (code ":governor-hold")) (esc (n :governor-hold)))
+                  (tr "of those, HARD governor-rule holds" (esc (count (rule-holds db))))
+                  (tr (str "human vetoes " (code ":approval-rejected")) (esc (n :approval-rejected)))
+                  (tr "human approvals granted"
+                      (esc (count (filter #(= :approved (:human %)) runs))))]))))
 
-(defn- coordination-section [title note rows]
-  (str "  <section class=\"card\">\n"
-       "    <h2>" title "</h2>\n"
-       "    <p class=\"muted\">" note "</p>\n"
-       "    <table>\n"
-       "      <thead><tr><th>coordination-id</th><th>storefront</th><th>payload</th></tr></thead>\n"
-       "      <tbody>\n"
-       (coordination-rows rows) "\n"
-       "      </tbody>\n"
-       "    </table>\n"
-       "  </section>\n"))
+(defn- verdict-cell [{:keys [verdict]}]
+  (cond
+    (nil? verdict) "<span class=\"muted\">—</span>"
+    (:hard? verdict)
+    (str "<span class=\"critical\">HARD</span> "
+         (str/join " " (map code (map :rule (:violations verdict)))))
+    (:escalate? verdict)
+    (str "<span class=\"warn\">escalate</span>"
+         (when (:always-escalate? verdict) " <span class=\"muted\">always-escalate</span>")
+         (when (:high-cost? verdict) " <span class=\"muted\">over cost threshold</span>"))
+    :else (str "<span class=\"ok\">clean</span> <span class=\"muted\">conf "
+               (esc (:confidence verdict)) "</span>")))
 
-(defn- governor-rows
-  "Read out of the REAL `autoparts.governor` vars -- change a policy
-  constant and this table moves without anyone editing this file."
-  []
-  (str/join "\n"
-    [(format "        <tr><td>1</td><td><span class=\"critical\">HARD</span></td><td><code>closed-op-allowlist</code></td><td>許可される操作は %s の4つのみ</td></tr>"
-             (esc (str/join " / " (sort (map name governor/allowed-ops)))))
-     "        <tr><td>2</td><td><span class=\"critical\">HARD</span></td><td><code>verified-party-gate</code></td><td>発起 storefront（および供給調整では対象 vendor）が独立検証済みでなければ commit しない</td></tr>"
-     "        <tr><td>3</td><td><span class=\"critical\">HARD</span></td><td><code>effect-propose-only</code></td><td>提案の <code>:effect</code> は <code>:propose</code> 以外を受け付けない — 本アクターは調整案しか書かない</td></tr>"
-     (format "        <tr><td>4</td><td><span class=\"critical\">HARD</span></td><td><code>compatibility-certification-finalization-block</code></td><td>恒久禁止。構造化フィールドのみで判定（禁止 op: %s ／ <code>:value</code> の真偽フラグ）— rationale 本文は走査しない</td></tr>"
-             (esc (str/join " / " (sort (map name governor/banned-finalization-ops)))))
-     (format "        <tr><td>5</td><td><span class=\"warn\">SOFT</span></td><td><code>confidence-floor</code></td><td>確信度 %s 未満は人間へエスカレーション</td></tr>"
-             (esc governor/confidence-floor))
-     "        <tr><td>6</td><td><span class=\"warn\">SOFT</span></td><td><code>compatibility-concern-always-escalates</code></td><td>適合性懸念のフラグはフェーズ・確信度によらず常に人間へ</td></tr>"
-     (format "        <tr><td>7</td><td><span class=\"warn\">SOFT</span></td><td><code>supply-order-cost-threshold</code></td><td>見積 %s を超える供給調整は常に人間へ</td></tr>"
-             (esc governor/supply-order-cost-threshold))]))
+(defn- human-cell [{:keys [approval human paused?]}]
+  (cond
+    (= :approved human) "<span class=\"ok\">approved</span>"
+    (= :rejected human) "<span class=\"critical\">rejected</span>"
+    (and approval (not paused?))
+    "<span class=\"muted\">never offered (no interrupt)</span>"
+    :else "<span class=\"muted\">—</span>"))
 
-(defn- phase-rows
-  "Read out of the REAL `autoparts.phase/phases` table."
-  []
-  (str/join "\n"
-    (for [p (sort (keys phase/phases))
-          :let [{:keys [label writes auto]} (get phase/phases p)]]
-      (format "        <tr><td class=\"num\">%s</td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
-              (esc p) (esc label)
-              (if (seq writes) (esc (str/join ", " (sort (map name writes))))
-                  "<span class=\"muted\">なし</span>")
-              (if (seq auto) (esc (str/join ", " (sort (map name auto))))
-                  "<span class=\"muted\">なし — 全件が人間の承認を要する</span>")))))
+(defn- disposition-cell [{:keys [disposition]}]
+  (case disposition
+    :commit   "<span class=\"ok\">commit</span>"
+    :hold     "<span class=\"critical\">hold</span>"
+    :escalate "<span class=\"warn\">escalate</span>"
+    (str "<span class=\"muted\">" (fmt disposition) "</span>")))
 
-(defn- facts-rows []
-  (str/join "\n"
-    (for [{:keys [id name class access url]} facts/catalog]
-      (format "        <tr><td><code>%s</code></td><td>%s</td><td><code>%s</code></td><td><code>%s</code></td><td>%s</td></tr>"
-              (esc (lbl id)) (esc name) (esc (lbl class)) (esc (lbl access))
-              (if url (format "<a href=\"%s\">%s</a>" (esc url) (esc url))
-                  "<span class=\"muted\">operator-registered（公開 URL なし）</span>")))))
+(defn- timeline-section [runs]
+  (card "Request timeline"
+        (str "One row = one " (code "langgraph.graph/run*") " over the compiled actor. The "
+             "<em>Governor</em> column is the verdict map the governor itself returned; the "
+             "<em>Human</em> column is the decision handed back to the graph while it was paused "
+             "at " (code ":request-approval") ". " (code "t11") " is driven by a deliberately "
+             "drifted advisor injected through " (code "operation/build") "'s "
+             (code ":advisor") " seam; " (code "t12") " is driven by an operator context still at "
+             "rollout phase 1.")
+        (table ["Thread" "Op" "Subject" "Phase" "Governor" "Human" "Final" "What this exercises"]
+               (for [{:keys [tid request escalation hold-fact exercises] :as r} runs]
+                 (tr (code tid)
+                     (code (:op request))
+                     (code (:subject request))
+                     (esc (:phase r))
+                     (verdict-cell r)
+                     (human-cell r)
+                     (str (disposition-cell r)
+                          (when-let [reason (:reason escalation)]
+                            (str " <span class=\"muted\">after escalation " (code reason)
+                                 "</span>"))
+                          (when-let [reason (:phase-reason hold-fact)]
+                            (str " <span class=\"muted\">phase gate " (code reason) "</span>")))
+                     (str "<span class=\"muted\">" (esc exercises) "</span>"))))))
 
-;; ───────────────────────── document ─────────────────────────
+(defn- holds-section [db]
+  (let [hs (holds db)]
+    (card "Governor HARD holds (append-only ledger)"
+          (str "Each row is one " (code ":violations") " entry of a " (code ":governor-hold")
+               " fact. The rule name and the Japanese detail text are the governor's own output "
+               "-- this page holds no rule text of its own. A HARD hold never reaches a human: it "
+               "cannot be approved away.")
+          (table ["Rule" "Op" "Subject" "Confidence" "Governor's own detail"]
+                 (for [h hs
+                       v (:violations h)]
+                   (tr (str "<span class=\"critical\">" (esc (:rule v)) "</span>")
+                       (code (:op h))
+                       (code (:subject h))
+                       (fmt (:confidence h))
+                       (esc (:detail v))))))))
+
+(defn- phase-holds-section [db]
+  (let [ps (filterv #(and (= :governor-hold (:t %)) (empty? (:violations %))) (ledger-of db))]
+    (when (seq ps)
+      (card "Rollout-phase holds"
+            (str "A hold with an EMPTY " (code ":basis") ": the governor found no violation, and "
+                 (code "autoparts.phase/gate") " -- the second, independent layer -- refused the "
+                 "write anyway because the op is not yet enabled at that deployment's rollout "
+                 "phase.")
+            (table ["Op" "Subject" "Phase" "Phase reason" "Confidence"]
+                   (for [p ps]
+                     (tr (code (:op p)) (code (:subject p)) (fmt (:phase p))
+                         (code (:phase-reason p)) (fmt (:confidence p)))))))))
+
+(defn- rejections-section [db]
+  (let [rs (filterv #(= :approval-rejected (:t %)) (ledger-of db))]
+    (when (seq rs)
+      (card "Human vetoes"
+            (str "A governor-clean proposal a person declined. Written to the ledger by the same "
+                 (code ":hold") " node, with basis " (code ":approver-rejected") " -- not a "
+                 "compliance violation.")
+            (table ["Op" "Subject" "Basis" "Confidence"]
+                   (for [r rs]
+                     (tr (code (:op r)) (code (:subject r))
+                         (codes (:basis r)) (fmt (:confidence r)))))))))
+
+;; The ONE hand-written table on this page: a static description of the
+;; fixed op-gate contract -- which of the four scoped ops can ever
+;; auto-commit, and which is permanently human-only. Documentation of
+;; fixed behavior, not runtime telemetry. The two derived columns beside
+;; it ARE read from `autoparts.phase/phases`, so a drift between this
+;; prose and the code shows up as a contradiction on the page itself.
+(def ^:private op-gate-contract
+  {:log-sales-record
+   "may auto-commit when the governor is clean at phase 3"
+   :schedule-restocking-operation
+   "may auto-commit when the governor is clean at phase 3; drafts a schedule, restocks nothing"
+   :flag-compatibility-concern
+   "ALWAYS a human decision, at every phase and every confidence -- surfaces a concern, never resolves or certifies one"
+   :coordinate-supply-order
+   "may auto-commit when the governor is clean at phase 3 AND below the cost threshold; drafts an order, transmits nothing"})
+
+(defn- phase-section []
+  (let [ph (:phase coordinator)
+        {:keys [label writes auto]} (get phase/phases ph)]
+    (card (str "Op gate — rollout phase " ph " (" label ")")
+          (str "The <em>may write</em> and <em>may auto-commit</em> columns are derived from "
+               (code "autoparts.phase/phases") "; the <em>fixed contract</em> column is a static "
+               "description of the closed op contract (README <code>Scope</code>). A governor HOLD "
+               "always stays a HOLD; an op that may write but is not auto-eligible escalates to a "
+               "human even when the governor is clean.")
+          (table ["Op" "May write in this phase" "May auto-commit when governor-clean"
+                  "Fixed contract"]
+                 (for [o (sort-by str governor/allowed-ops)]
+                   (tr (code o)
+                       (if (contains? writes o)
+                         "<span class=\"ok\">yes</span>"
+                         "<span class=\"critical\">no — HOLD (:phase-disabled)</span>")
+                       (if (contains? auto o)
+                         "<span class=\"ok\">yes</span>"
+                         "<span class=\"warn\">no — always human approval</span>")
+                       (esc (get op-gate-contract o "—"))))))))
+
+(defn- governor-section []
+  (card "Governor configuration"
+        (str "Read straight off the public vars of " (code "autoparts.governor") ".")
+        (table ["Setting" "Value"]
+               [(tr "confidence floor (SOFT — escalates)" (code governor/confidence-floor))
+                (tr "supply-order cost threshold (SOFT — escalates)"
+                    (code governor/supply-order-cost-threshold))
+                (tr "closed op allowlist (HARD)" (kw-codes governor/allowed-ops))
+                (tr "banned finalization ops (HARD, permanent)"
+                    (kw-codes governor/banned-finalization-ops))])))
+
+(defn- parties-section [db]
+  (let [led (ledger-of db)
+        seed (store/demo-data)
+        last-fact (fn [id] (last (filter #(= id (:subject %)) led)))
+        status (fn [id]
+                 (let [f (last-fact id)]
+                   (cond
+                     (nil? f) "<span class=\"muted\">no ledger activity</span>"
+                     (= :committed (:t f)) "<span class=\"ok\">last op committed</span>"
+                     (= :approval-rejected (:t f))
+                     "<span class=\"critical\">last op vetoed by approver</span>"
+                     (= :governor-hold (:t f))
+                     (str "<span class=\"critical\">last op held</span> " (codes (:basis f)))
+                     :else (str "<span class=\"muted\">" (esc (:t f)) "</span>"))))]
+    (card "Parties (verified-party gate)"
+          (str "Read back through the " (code "Store") " protocol after the run -- "
+               (code "store/storefront") " and " (code "store/vendor") ", for the ids "
+               (code "store/demo-data") " actually seeds. An unverified party can never have a "
+               "proposal committed on its behalf, and a vendor is checked independently of the "
+               "storefront initiating the order.")
+          (table ["Kind" "Id" "Name" "verified?" "Ledger status"]
+                 (concat
+                  (for [id (sort (keys (:storefronts seed)))
+                        :let [s (store/storefront db id)]]
+                    (tr "storefront" (code (:id s)) (esc (:name s)) (flag (:verified? s))
+                        (status id)))
+                  (for [id (sort (keys (:vendors seed)))
+                        :let [v (store/vendor db id)]]
+                    (tr "vendor" (code (:id v)) (esc (:name v)) (flag (:verified? v))
+                        (status id))))))))
+
+(defn- log-card [title note headers row-fn rows]
+  (card title note
+        (if (seq rows)
+          (table headers (map row-fn rows))
+          "<p class=\"muted\">none committed in this run</p>")))
+
+(defn- coordination-logs-section [db]
+  (str
+   (log-card "Sales-record coordination log"
+             (str "Committed entries from " (code "store/sales-log") ". The "
+                  (code ":coordination-id") " is minted at commit time by "
+                  (code "autoparts.registry/register-coordination-record") ".")
+             ["Coordination id" "Storefront" "SKU" "Qty" "Type" "Amount"]
+             (fn [r] (tr (code (:coordination-id r)) (code (:storefront-id r))
+                         (fmt (:sku r)) (fmt (:qty r)) (fmt (:type r)) (fmt (:amount r))))
+             (store/sales-log db))
+   "\n"
+   (log-card "Restocking-schedule coordination log"
+             (str "Committed entries from " (code "store/restock-log")
+                  ". A draft a warehouse system acts on -- this actor restocks no shelf.")
+             ["Coordination id" "Storefront" "SKU" "Qty" "Requested date"]
+             (fn [r] (tr (code (:coordination-id r)) (code (:storefront-id r))
+                         (fmt (:sku r)) (fmt (:qty r)) (fmt (:requested-date r))))
+             (store/restock-log db))
+   "\n"
+   (log-card "Compatibility-concern log"
+             (str "Committed entries from " (code "store/concern-log")
+                  ". Every one of these reached a human first -- this op is never auto-committed "
+                  "at any phase. Flagging a concern is not resolving it.")
+             ["Coordination id" "Storefront" "SKU" "Concern type" "Detail"]
+             (fn [r] (tr (code (:coordination-id r)) (code (:storefront-id r))
+                         (fmt (:sku r)) (fmt (:concern-type r)) (fmt (:detail r))))
+             (store/concern-log db))
+   "\n"
+   (log-card "Supply-order coordination log"
+             (str "Committed entries from " (code "store/supply-order-log")
+                  ". A draft a human buyer acts on -- no purchase order is transmitted and no "
+                  "payment is settled.")
+             ["Coordination id" "Storefront" "Vendor" "SKU" "Qty" "Estimated cost"]
+             (fn [r] (tr (code (:coordination-id r)) (code (:storefront-id r))
+                         (code (:vendor-id r)) (fmt (:sku r)) (fmt (:qty r))
+                         (fmt (:estimated-cost r))))
+             (store/supply-order-log db))))
+
+(defn- facts-section []
+  (let [{:keys [source-count note]} (facts/coverage)]
+    (card "Concern-source catalog"
+          (str "Honest coverage report from " (code "autoparts.facts/coverage") ": "
+               (esc source-count) " source(s). " (esc note))
+          (table ["Id" "Name" "Class" "Access" "URL"]
+                 (for [f facts/catalog]
+                   (tr (code (:id f)) (esc (:name f)) (code (:class f)) (code (:access f))
+                       (if-let [u (:url f)]
+                         (str "<a href=\"" (esc u) "\">" (esc u) "</a>")
+                         "—")))))))
+
+(defn- ledger-section [db]
+  (card "Audit ledger (append-only)"
+        (str "The full ledger, in append order, exactly as " (code "autoparts.store/ledger")
+             " returns it. Note that " (code ":approval-granted") " is emitted to the graph's "
+             "in-memory " (code ":audit") " channel only -- " (code "autoparts.operation")
+             " never appends it to the store ledger, so an approved request is visible here as "
+             "the " (code ":committed") " fact it produced.")
+        (table ["#" "Fact" "Op" "Subject" "Actor" "Disposition" "Basis"]
+               (map-indexed
+                (fn [i f]
+                  (tr (esc (inc i))
+                      (let [cls (case (:t f)
+                                  :committed "ok"
+                                  :governor-hold "critical"
+                                  :approval-rejected "critical"
+                                  "muted")]
+                        (str "<span class=\"" cls "\">" (esc (:t f)) "</span>"))
+                      (code (:op f)) (code (:subject f)) (fmt (:actor f))
+                      (fmt (:disposition f)) (codes (:basis f))))
+                (ledger-of db)))))
+
+;; ----------------------------- page -----------------------------
 
 (defn render
-  "Renders the whole operator console from a real `run-demo!` result."
+  "The whole page, from the post-run store and the run log."
   [{:keys [db runs]}]
-  (let [ledger    (vec (store/ledger db))
-        outcomes  (map run-outcome runs)
-        n-hold    (count (filter #(= :hold (:kind %)) outcomes))
-        n-approved (count (filter #(= :approved (:kind %)) outcomes))
-        n-auto    (count (filter #(= :auto (:kind %)) outcomes))
-        n-rejected (count (filter #(= :rejected (:kind %)) outcomes))
-        cov       (facts/coverage)]
-    (str
-     "<!doctype html>\n"
-     "<html lang=\"ja\"><head><meta charset=\"utf-8\">"
-     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-     "<title>cloud-itonami-isic-4530 · 自動車部品小売オペレーション調整 — Operator Console</title><style>"
-     (jp-go-dds.skin/dds+skin)
-     "</style></head><body>\n"
-     "<header class=\"bar\">\n"
-     "  <h1>自動車部品の小売・卸 (ISIC 4530) — Operator Console</h1>\n"
-     "</header>\n"
-     "<p class=\"subtitle\"><span class=\"badge\">read-only sample</span> "
-     "<span class=\"badge\">governor-gated</span> "
-     "<span class=\"badge\">適合性認証の確定は恒久的に権限外</span></p>\n"
-     "<main>\n"
-
-     "  <section class=\"card\">\n"
-     "    <h2>この実行の結果</h2>\n"
-     "    <p class=\"muted\">このページは手書きではありません。<code>clojure -M:dev:render-html</code> が "
-     "<code>autoparts.operation</code> の langgraph StateGraph を実際に実行し、その "
-     "<code>autoparts.store</code> / 監査台帳 / 実行トレースから生成しています。"
-     "タイムスタンプも乱数 ID も含まないため、同じシードからの再実行はバイト単位で同一です。</p>\n"
-     "    <table>\n"
-     "      <thead><tr><th>区分</th><th class=\"num\">件数</th><th>意味</th></tr></thead>\n"
-     "      <tbody>\n"
-     (format "        <tr><td><span class=\"ok\">自動確定</span></td><td class=\"num\">%s</td><td>ガバナ清潔・確信度フロア以上・フェーズ3で自動可の操作</td></tr>\n" n-auto)
-     (format "        <tr><td><span class=\"ok\">承認のうえ確定</span></td><td class=\"num\">%s</td><td>人間の承認者に渡り、承認されてから確定した操作</td></tr>\n" n-approved)
-     (format "        <tr><td><span class=\"warn\">承認者が却下</span></td><td class=\"num\">%s</td><td>人間に渡ったが承認されず hold になった操作</td></tr>\n" n-rejected)
-     (format "        <tr><td><span class=\"critical\">HARD hold</span></td><td class=\"num\">%s</td><td>人間に到達せず、承認では上書きできない hold</td></tr>\n" n-hold)
-     (format "        <tr><td>監査台帳の総件数</td><td class=\"num\">%s</td><td>append-only。commit も hold も同じ台帳に残る</td></tr>\n" (count ledger))
-     "      </tbody>\n"
-     "    </table>\n"
-     "  </section>\n"
-
-     "  <section class=\"card\">\n"
-     "    <h2>当事者ディレクトリ（<code>autoparts.store</code> のシード）</h2>\n"
-     "    <p class=\"muted\">未検証の当事者は、提案がどれだけ妥当に見えても commit されません（<code>verified-party-gate</code>、HARD）。</p>\n"
-     "    <table>\n"
-     "      <thead><tr><th>種別</th><th>id</th><th>名称</th><th>検証状態</th></tr></thead>\n"
-     "      <tbody>\n"
-     (party-rows db) "\n"
-     "      </tbody>\n"
-     "    </table>\n"
-     "  </section>\n"
-
-     "  <section class=\"card\">\n"
-     "    <h2>実行された操作（1 行 = 1 グラフ実行）</h2>\n"
-     "    <p class=\"muted\">確信度は <code>autoparts.governor/check</code> が返した実際の verdict の値です。"
-     "<code>t13</code> / <code>t14</code> は改竄アドバイザ（<code>:effect</code> の詐称・<code>:value</code> への認証確定フラグ注入）で、"
-     "ガバナがアドバイザから独立していることを実際に確かめています。"
-     "<code>t04</code> は既定の懸念 rationale が「認証」という語を含んだまま commit されること、"
-     "すなわちガバナが本文走査ではなく構造化フィールドで判定していることの回帰確認です。</p>\n"
-     "    <table>\n"
-     "      <thead><tr><th>run</th><th>シナリオ</th><th>op</th><th>subject</th><th>phase</th><th>確信度</th><th>結果</th><th>根拠</th></tr></thead>\n"
-     "      <tbody>\n"
-     (run-rows runs) "\n"
-     "      </tbody>\n"
-     "    </table>\n"
-     "  </section>\n"
-
-     "  <section class=\"card\">\n"
-     "    <h2>AutoPartsOpsGovernor の判定順序</h2>\n"
-     "    <p class=\"muted\">HARD 違反は人間の承認者でも上書きできません（承認ノードにすら到達しません）。"
-     "SOFT は人間に回るだけで、承認されれば commit されます。この表は "
-     "<code>autoparts.governor</code> の実際の var から生成しています。</p>\n"
-     "    <table>\n"
-     "      <thead><tr><th>#</th><th>強度</th><th>rule</th><th>内容</th></tr></thead>\n"
-     "      <tbody>\n"
-     (governor-rows) "\n"
-     "      </tbody>\n"
-     "    </table>\n"
-     "  </section>\n"
-
-     "  <section class=\"card\">\n"
-     "    <h2>ロールアウトフェーズ（<code>autoparts.phase/phases</code>）</h2>\n"
-     "    <p class=\"muted\"><code>flag-compatibility-concern</code> はフェーズ3を含むどのフェーズの自動確定集合にも入っていません。"
-     "これはロールアウトの残作業ではなく恒久的な構造です。</p>\n"
-     "    <table>\n"
-     "      <thead><tr><th>phase</th><th>label</th><th>書き込み可</th><th>自動確定可</th></tr></thead>\n"
-     "      <tbody>\n"
-     (phase-rows) "\n"
-     "      </tbody>\n"
-     "    </table>\n"
-     "  </section>\n"
-
-     "  <section class=\"card\">\n"
-     "    <h2>監査台帳（この実行の全件）</h2>\n"
-     "    <p class=\"muted\">append-only の決定事実ログ。commit も hold も同じ台帳に残ります。</p>\n"
-     "    <table>\n"
-     "      <thead><tr><th>fact</th><th>op</th><th>subject</th><th>disposition</th><th>根拠</th><th>確信度</th><th>詳細</th></tr></thead>\n"
-     "      <tbody>\n"
-     (ledger-rows ledger) "\n"
-     "      </tbody>\n"
-     "    </table>\n"
-     "  </section>\n"
-
-     (coordination-section "売上/入出庫記録ログ"
-                           "確定した <code>:log-sales-record</code> 調整レコード。coordination-id は storefront × 種別ごとの連番から決まります。"
-                           (store/sales-log db))
-     (coordination-section "補充スケジュールログ"
-                           "確定した <code>:schedule-restocking-operation</code> 調整レコード。棚を補充する行為そのものではなく、そのドラフトです。"
-                           (store/restock-log db))
-     (coordination-section "適合性懸念ログ"
-                           "確定した <code>:flag-compatibility-concern</code> 調整レコード。懸念の<em>提起</em>のみで、判定・認証は含みません。"
-                           (store/concern-log db))
-     (coordination-section "供給調整ログ"
-                           "確定した <code>:coordinate-supply-order</code> 調整レコード。発注の送信でも決済でもありません。"
-                           (store/supply-order-log db))
-
-     "  <section class=\"card\">\n"
-     "    <h2>引用可能な公開ソース（<code>autoparts.facts</code>）</h2>\n"
-     (format "    <p class=\"muted\">%s</p>\n" (esc (:note cov)))
-     "    <table>\n"
-     "      <thead><tr><th>id</th><th>名称</th><th>class</th><th>access</th><th>URL</th></tr></thead>\n"
-     "      <tbody>\n"
-     (facts-rows) "\n"
-     "      </tbody>\n"
-     "    </table>\n"
-     "  </section>\n"
-
-     "</main>\n"
-     "<footer>\n"
-     "  <p>cloud-itonami-isic-4530 — 自動車部品小売/卸のオペレーション調整アクター。"
-     "本アクターは部品適合性の認証機関でもリコール是正の判断主体でもありません。"
-     "適合性の確定・リコール是正の最終判断は製造者・認定検査機関・所管規制当局に属します。</p>\n"
-     "  <p>生成: <code>clojure -M:dev:render-html</code>（実アクター実行からのビルド時生成、決定的）</p>\n"
-     "</footer>\n"
-     "</body></html>\n")))
+  (str "<!DOCTYPE html>\n<html lang=\"en\">\n<head><meta charset=\"utf-8\">"
+       "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+       "<meta name=\"color-scheme\" content=\"light\">"
+       "<title>Operator console — cloud-itonami-isic-4530 (autoparts)</title>"
+       "<style>" (jp-go-dds.skin/dds+skin) "</style></head>\n<body>\n"
+       "<header class=\"bar\">"
+       "<span class=\"badge\">ISIC 4530</span>"
+       "<span class=\"badge\">autoparts</span>"
+       "<span class=\"badge\">auto-parts-ops-governor</span>"
+       "</header>\n"
+       "<h1>Sale of motor vehicle parts and accessories — operator console</h1>"
+       "<p class=\"subtitle\">actor <code>" (esc (:actor-id coordinator))
+       "</code> · role <code>" (esc (:actor-role coordinator))
+       "</code> · default rollout phase <code>" (esc phase/default-phase)
+       "</code> · read-only sample, governor-gated, compatibility concerns always human-decided</p>\n"
+       "<main>\n"
+       (str/join "\n"
+                 (remove nil?
+                         [(summary-section db runs)
+                          (timeline-section runs)
+                          (holds-section db)
+                          (phase-holds-section db)
+                          (rejections-section db)
+                          (phase-section)
+                          (governor-section)
+                          (parties-section db)
+                          (coordination-logs-section db)
+                          (facts-section)
+                          (ledger-section db)]))
+       "\n</main>\n<footer>"
+       "Generated at build time by <code>autoparts.render-html</code> "
+       "(<code>clojure -M:dev:render-html</code>) by driving the real "
+       "<code>autoparts.operation</code> actor graph over the real "
+       "<code>autoparts.store</code> seed. Deterministic — no clock, no randomness, no network. "
+       "This actor coordinates only: it never restocks a shelf, transmits a purchase order, "
+       "settles a sale, or certifies part compatibility."
+       "</footer>\n</body>\n</html>\n"))
 
 (defn -main [& args]
-  (let [out    (or (first args) "docs/samples/operator-console.html")
-        result (run-demo!)
-        ledger (vec (store/ledger (:db result)))
-        holds  (filterv #(= :governor-hold (:t %)) ledger)
-        html   (render result)]
-    ;; Build-time invariant, not a convention: this console exists to
-    ;; show that the governor actually refuses things. A scenario that
-    ;; produced no un-overridable hold would render a page that quietly
-    ;; misrepresents the actor, so refuse to write it at all.
-    (when (zero? (count holds))
-      (throw (ex-info (str "REFUSING to write " out
-                           ": the scenario produced ZERO :governor-hold ledger entries. "
-                           "This console must demonstrate at least one HARD hold "
-                           "(a hold that never reaches a human). Fix the scenario in "
-                           "`autoparts.render-html/run-demo!` -- do not weaken this check.")
-                      {:out out
-                       :ledger-count (count ledger)
-                       :governor-holds 0
-                       :fact-kinds (frequencies (map :t ledger))})))
-    (io/make-parents out)
-    (spit out html)
+  (let [out (or (first args) "docs/samples/operator-console.html")
+        {:keys [db runs] :as result} (run-demo!)
+        hs (holds db)
+        hard (rule-holds db)]
+    ;; Build-time invariant: a console that shows no real HARD hold is
+    ;; not evidence of a governor. Do not weaken this.
+    (when (empty? hs)
+      (throw (ex-info "no :governor-hold fact on the ledger — refusing to write a console that shows no real hold"
+                      {:ledger-facts (count (store/ledger db))
+                       :requests (count runs)})))
+    (when (empty? hard)
+      (throw (ex-info "no :governor-hold fact carries a governor rule violation — refusing to write a console whose only holds are rollout-phase holds"
+                      {:holds (count hs)})))
+    (let [f (java.io.File. ^String out)]
+      (when-let [p (.getParentFile f)] (.mkdirs p))
+      (spit f (render result)))
     (println "wrote" out
-             (str "(" (count ledger) " ledger facts, "
-                  (count holds) " governor holds, "
-                  (count (filter #(= :approval-granted (:t %))
-                                 (mapcat :audit (:runs result))))
-                  " human approvals, "
-                  (count (:runs result)) " graph runs)"))))
+             (str "(" (count (store/ledger db)) " ledger facts, "
+                  (count hard) " HARD governor-rule holds, "
+                  (count hs) " total holds, "
+                  (count runs) " requests)"))))
