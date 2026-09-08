@@ -28,7 +28,7 @@
   (default `docs/samples/operator-console.html`)."
   (:require [jp-go-dds.skin]
             [clojure.java.io :as io]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [autoparts.store :as store]
             [autoparts.operation :as op]
             [autoparts.governor :as governor]
