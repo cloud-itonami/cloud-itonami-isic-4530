@@ -32,7 +32,7 @@
   structurally, not just at the governor boundary."
   (:require #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [autoparts.store :as store]
             [langchain.model :as model]))
 

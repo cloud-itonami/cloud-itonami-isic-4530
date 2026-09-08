@@ -19,7 +19,7 @@
   violations` check is the RUNTIME enforcement of that boundary; the
   absence of a certificate-builder here is the STRUCTURAL one (there is
   nothing to call even if the governor were bypassed)."
-  (:require [clojure.string :as str]))
+  (:require [kotoba.lang.text :as str]))
 
 (defn- zero-pad [n w]
   (let [s (str n)]
@@ -39,9 +39,9 @@
     (throw (ex-info "coordination-record: storefront-id required" {})))
   (when (< sequence 0)
     (throw (ex-info "coordination-record: sequence must be >= 0" {})))
-  (let [coordination-id (str (str/upper-case storefront-id) "-" op-code "-" (zero-pad sequence 6))]
+  (let [coordination-id (str (str/upper storefront-id) "-" op-code "-" (zero-pad sequence 6))]
     {"record" {"record_id" coordination-id
-               "kind" (str (str/lower-case op-code) "-coordination-draft")
+               "kind" (str (str/lower op-code) "-coordination-draft")
                "storefront_id" storefront-id
                "immutable" true}
      "coordination_id" coordination-id}))
