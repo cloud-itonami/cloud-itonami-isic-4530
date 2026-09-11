@@ -6,8 +6,8 @@ AutoPartsOpsGovernor's policy tests, documentation and operator model.
 ## Development
 
 ```bash
-clojure -M:dev:test
-clojure -M:lint
+kbb -M:dev:test
+kbb -M:lint
 ```
 
 ## Rules

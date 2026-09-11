@@ -113,9 +113,9 @@ cost exceeds the threshold.
 ## Run
 
 ```bash
-clojure -M:dev:run     # walk clean coordination proposals + a compatibility-concern flag through the actor, then six HARD-hold scenarios
-clojure -M:dev:test    # governor contract · phase invariants · store parity
-clojure -M:lint        # clj-kondo (errors fail; CI mirrors this)
+kbb -M:dev:run     # walk clean coordination proposals + a compatibility-concern flag through the actor, then six HARD-hold scenarios
+kbb -M:dev:test    # governor contract · phase invariants · store parity
+kbb -M:lint        # clj-kondo (errors fail; CI mirrors this)
 ```
 
 ## Robotics premise
