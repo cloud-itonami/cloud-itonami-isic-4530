@@ -30,11 +30,11 @@
   ;; io.github.com-junkawasaki/langchain-clj. langgraph declares the same
   ;; library as io.github.kotoba-lang/langchain, so the entry matched no
   ;; node in the resolved tree and never reached the classpath -- verified
-  ;; with `clojure -Stree`/-Spath, unchanged before and after removal.
+  ;; with `kbb -Stree`/-Spath, unchanged before and after removal.
   :dev {}
-  ;; clojure -M:dev:run  -> drive the demo through one OperationActor
+  ;; kbb -M:dev:run  -> drive the demo through one OperationActor
   :run {:main-opts ["-m" "autoparts.sim"]}
-  ;; clojure -M:dev:render-html [out-file] -> regenerate
+  ;; kbb -M:dev:render-html [out-file] -> regenerate
   ;; docs/samples/operator-console.html by actually RUNNING the actor
   ;; (flagship checklist item 2). Deterministic: byte-identical reruns.
   :render-html {:main-opts ["-m" "autoparts.render-html"]}
@@ -47,7 +47,7 @@
   ;; ClojureScript host (runtime priority: cljs first, JVM compat) --
   ;; superproject CLAUDE.md: kotoba wasm runtime > clojurewasm > cljs >
   ;; nbb > (JVM / bb last resort).
-  ;;   clojure -Sdeps '{:paths ["src" "test"]}' -M:dev:cljs \
+  ;;   kbb -Sdeps '{:paths ["src" "test"]}' -M:dev:cljs \
   ;;     -m cljs.main --target node -m autoparts.portable-cljs-test-runner
   :cljs {:extra-deps {org.clojure/clojurescript {:mvn/version "1.11.132"}}}
   ;; static analysis -- clj-kondo from deps (no binary), errors fail CI.

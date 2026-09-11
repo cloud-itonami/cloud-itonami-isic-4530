@@ -1,5 +1,5 @@
 (ns autoparts.sim
-  "Demo driver -- `clojure -M:dev:run`. Walks a clean storefront through
+  "Demo driver -- `kbb -M:dev:run`. Walks a clean storefront through
   sales-record logging (auto-commits) -> restock scheduling (auto-
   commits) -> a low-cost supply-order coordination (auto-commits) ->
   a compatibility-concern flag (ALWAYS escalates/approve), then shows
