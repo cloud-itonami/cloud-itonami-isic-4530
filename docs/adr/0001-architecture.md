@@ -83,7 +83,7 @@ violations` checks only an exact `:op` match against
 (`:compatibility-certification-finalized?` / `:certification-
 finalize?`) -- both phrased as the finalization/execution ACTION, never
 a bare noun -- and never scans `:rationale`/`:summary` prose.
-`test/autoparts/governor_contract_test.cljc`'s
+`test/autoparts/governor_contract_test.cljk`'s
 `default-mock-advisor-proposals-never-self-trip-scope-exclusion` is the
 executable regression proof: it runs the mock advisor's own default
 proposal for all four in-scope ops against clean, verified demo data
@@ -132,7 +132,7 @@ whether a citation is sufficient to resolve one.
   (`direct-certification-finalization-flag-is-a-hard-permanent-
   violation`) and the mandatory happy-path non-self-trip test.
 - (+) `MemStore` ‖ `DatomicStore` parity is proven by
-  `test/autoparts/store_contract_test.cljc`, the same `:db-api`-driven
+  `test/autoparts/store_contract_test.cljk`, the same `:db-api`-driven
   swap pattern every sibling store uses.
 - (-) This R0 does not integrate a real POS, warehouse-management, or
   procurement system -- each operator's responsibility.

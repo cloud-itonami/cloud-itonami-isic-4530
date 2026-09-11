@@ -69,7 +69,7 @@ PERMANENT, un-overridable block (`compatibility-certification-
 finalization-block`), checked via structured fields only -- never by
 scanning free-text rationale for a bare noun, a documented self-trip
 bug class this fleet has independently hit and fixed more than once
-(see `test/autoparts/governor_contract_test.cljc`'s
+(see `test/autoparts/governor_contract_test.cljk`'s
 `default-mock-advisor-proposals-never-self-trip-scope-exclusion`).
 `:flag-compatibility-concern` ALWAYS escalates to a human, at any
 confidence, any phase -- two independent layers enforce this
@@ -165,14 +165,14 @@ generic robotics/identity/forms/dmn/bpmn/audit-ledger/retail stack.
 
 | File | Role |
 |---|---|
-| `src/autoparts/store.cljc` | **Store** protocol -- `MemStore` ‖ `DatomicStore` (`kotoba-lang/langchain-store`). Adopts BOTH the entity-store pattern (storefront/vendor) and the seq-keyed event-stream pattern (ledger + the four coordination logs) |
-| `src/autoparts/registry.cljc` | Pure-function coordination-record construction. Deliberately has NO certificate-issuing function -- this actor never certifies anything |
-| `src/autoparts/facts.cljc` | Small, honest catalog of real public sources a compatibility-concern flag MAY cite (informational, not a governor gate in this R0) |
-| `src/autoparts/partsopsadvisor.cljc` | **PartsOpsAdvisor** -- `mock-advisor` ‖ `llm-advisor`; sales-record / restock / concern-flag / supply-order proposals, every branch hard-coded to `:effect :propose` |
-| `src/autoparts/governor.cljc` | **AutoPartsOpsGovernor** -- 4 HARD checks (closed-op-allowlist · verified-party-gate · effect-propose-only · compatibility-certification-finalization-block) + 3 SOFT escalate rules (confidence floor · compatibility-concern always-escalate · supply-order cost-threshold) |
-| `src/autoparts/phase.cljc` | **Phase 0→3** -- read-only → assisted logging → assisted coordination → supervised (compatibility-concern flags always human; the other three ops are auto-eligible when clean) |
-| `src/autoparts/operation.cljc` | **OperationActor** -- langgraph StateGraph |
-| `src/autoparts/sim.cljc` | demo driver |
+| `src/autoparts/store.cljk` | **Store** protocol -- `MemStore` ‖ `DatomicStore` (`kotoba-lang/langchain-store`). Adopts BOTH the entity-store pattern (storefront/vendor) and the seq-keyed event-stream pattern (ledger + the four coordination logs) |
+| `src/autoparts/registry.cljk` | Pure-function coordination-record construction. Deliberately has NO certificate-issuing function -- this actor never certifies anything |
+| `src/autoparts/facts.cljk` | Small, honest catalog of real public sources a compatibility-concern flag MAY cite (informational, not a governor gate in this R0) |
+| `src/autoparts/partsopsadvisor.cljk` | **PartsOpsAdvisor** -- `mock-advisor` ‖ `llm-advisor`; sales-record / restock / concern-flag / supply-order proposals, every branch hard-coded to `:effect :propose` |
+| `src/autoparts/governor.cljk` | **AutoPartsOpsGovernor** -- 4 HARD checks (closed-op-allowlist · verified-party-gate · effect-propose-only · compatibility-certification-finalization-block) + 3 SOFT escalate rules (confidence floor · compatibility-concern always-escalate · supply-order cost-threshold) |
+| `src/autoparts/phase.cljk` | **Phase 0→3** -- read-only → assisted logging → assisted coordination → supervised (compatibility-concern flags always human; the other three ops are auto-eligible when clean) |
+| `src/autoparts/operation.cljk` | **OperationActor** -- langgraph StateGraph |
+| `src/autoparts/sim.cljk` | demo driver |
 | `test/autoparts/*_test.cljc` | governor contract (incl. the mandatory self-trip regression test) · phase invariants · store parity |
 
 ## Business-process coverage (honest)

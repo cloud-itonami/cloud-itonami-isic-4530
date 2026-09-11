@@ -23,7 +23,7 @@ clojure -M:lint
 - Before adding or changing a governor scope-exclusion check, confirm it is
   phrased as the finalization/execution ACTION (a structured field/keyword),
   never a bare noun scanned out of free text -- see
-  `test/autoparts/governor_contract_test.cljc`'s
+  `test/autoparts/governor_contract_test.cljk`'s
   `default-mock-advisor-proposals-never-self-trip-scope-exclusion` for why.
 - Document any new business-model or operator assumption in `docs/`.
 
