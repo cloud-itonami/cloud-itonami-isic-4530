@@ -18,7 +18,7 @@
   `autoparts.governor` avoids this by construction (structured-field
   checks only, never free-text scanning) -- this test is the executable
   proof that construction holds."
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [langgraph.graph :as g]
             [autoparts.governor :as governor]
             [autoparts.operation :as op]
