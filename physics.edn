@@ -1,0 +1,33 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:dev:physics` runs it.
+;;
+;; README "Robotics premise": an autonomous warehouse picking/restocking
+;; robot carries out the restocking that this motor-vehicle parts actor
+;; (ISIC 4530) coordinates. The physical work: an arm putting a parts box
+;; (brake rotors, batteries) away on the bin shelf, and an AMR carrying a
+;; tall tote tower of parts down the aisle.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isic-4530"
+ :cases
+ [{:id :put-away-parts-box
+   :kind :manipulator
+   :procedure "restocking arm lifts a boxed part (brake rotor, starter battery) from the tote and puts it away on the bin shelf"
+   :params {:l1-m 0.60 :l2-m 0.50 :m1-kg 8.0 :m2-kg 5.0
+            :from [0.70 0.10] :to [0.35 0.80] :duration-s 2.0 :steps 400}
+   :sweep {:param :payload-kg :values [2.0 5.0 10.0 15.0 22.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 180.0 :basis "estimate: continuous shoulder torque of a ~10 kg-payload collaborative arm"}
+   :boundary {:lo 0.5 :hi 60.0}}
+  {:id :tote-tower-amr-estop
+   :kind :transport
+   :procedure "AMR carries a tower of 60 kg of parts totes down the warehouse aisle and makes an emergency stop at 2 m/s2"
+   :params {:mass-kg 120.0 :payload-kg 60.0 :distance-m 40.0 :v-max-mps 1.5 :a-max-mps2 0.5
+            :brake-decel-mps2 2.0 :drive-force-n 250.0 :crr 0.015 :cog-height-m 0.30
+            :support-half-length-m 0.30 :max-time-s 600.0}
+   :sweep {:param :payload-cog-height-m :values [0.6 0.9 1.2 1.5 1.8]}
+   :quantity :min-tipover-margin
+   :limit {:min 0.5 :basis "estimate: half the static tip-over margin kept in an emergency stop, for tote shift and floor joints"}
+   :boundary {:lo 0.3 :hi 3.0}}]}
